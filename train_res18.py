@@ -1,0 +1,350 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision.datasets import ImageFolder
+from torchvision.transforms import Compose, ToTensor, Normalize, Resize
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models import resnet18
+from sklearn.metrics import accuracy_score, confusion_matrix
+import os
+import csv
+import numpy as np
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 定义超参数
+image_size = (224, 224)
+batch_size = 128
+learning_rate = 0.001
+weight_decay = 0.01
+num_epochs_backbone = 20
+num_epochs = 3
+num_epochs_continual = 10
+hidden_dim = 1000
+num_layers = 2
+num_heads = 8
+confidence_threshold = 0.95
+
+# 定义数据路径和血常规数据维度
+data_path = 'data/covid'
+blood_data_dim = 10
+
+# 定义图像预处理
+transform = Compose([
+    Resize(image_size),
+    ToTensor(),
+    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# 加载自定义数据集
+train_dataset = ImageFolder(os.path.join(data_path, 'train'), transform=transform)
+test_dataset = ImageFolder(os.path.join(data_path, 'test'), transform=transform)
+num_classes = len(train_dataset.classes)
+
+# 生成随机血常规数据并保存到CSV文件
+blood_data_ranges = {i: (i, i+1) for i in range(num_classes)}
+train_blood_data = []
+test_blood_data = []
+
+for idx, (_, label) in enumerate(train_dataset):
+    blood_feat = torch.FloatTensor(blood_data_dim).uniform_(*blood_data_ranges[label])
+    train_blood_data.append(blood_feat.numpy())
+
+for idx, (_, label) in enumerate(test_dataset):
+    blood_feat = torch.FloatTensor(blood_data_dim).uniform_(*blood_data_ranges[label])
+    test_blood_data.append(blood_feat.numpy())
+
+with open('train_blood_data.csv', 'w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerows(train_blood_data)
+
+with open('test_blood_data.csv', 'w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerows(test_blood_data)
+
+# 定义多模态数据集
+class MultimodalDataset(Dataset):
+    def __init__(self, image_dataset, blood_data):
+        self.image_dataset = image_dataset
+        self.blood_data = blood_data
+        
+    def __len__(self):
+        return len(self.image_dataset)
+    
+    def __getitem__(self, idx):
+        image, label = self.image_dataset[idx]
+        blood_feat = torch.tensor(self.blood_data[idx], dtype=torch.float32)
+        return image, blood_feat, label
+
+# 从CSV文件读取血常规数据
+with open('train_blood_data.csv', 'r') as file:
+    reader = csv.reader(file)
+    train_blood_data = [[float(x) for x in row] for row in reader]
+
+with open('test_blood_data.csv', 'r') as file:
+    reader = csv.reader(file)
+    test_blood_data = [[float(x) for x in row] for row in reader]
+
+# 创建多模态数据集
+train_multimodal_dataset = MultimodalDataset(train_dataset, train_blood_data)  
+test_multimodal_dataset = MultimodalDataset(test_dataset, test_blood_data)
+
+# 加载数据
+train_dataloader = DataLoader(train_multimodal_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+test_dataloader = DataLoader(test_multimodal_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+# 定义特征提取器
+class FeatureExtractor(nn.Module):
+    def __init__(self, pretrained=True):
+        super(FeatureExtractor, self).__init__()
+        self.model = resnet18(pretrained=pretrained)
+        self.pretrained = pretrained
+
+    def forward(self, x):
+        if self.pretrained:
+            x = self.model(x)
+        else:
+            x = nn.Sequential(*list(self.model.children())[:-1])(x)
+            x = torch.flatten(x, 1)
+        return x
+
+    def remove_last_layer(self):
+        self.pretrained = False
+
+# 定义SEBlock
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+# 定义SETransformerFusion模型
+class SETransformerFusion(nn.Module):
+    def __init__(self, image_feat_dim, blood_feat_dim, hidden_dim, num_classes, num_layers, num_heads):
+        super(SETransformerFusion, self).__init__()
+        self.image_embedding = nn.Linear(image_feat_dim, hidden_dim)
+        self.blood_embedding = nn.Linear(blood_feat_dim, hidden_dim)
+        self.image_se = SEBlock(hidden_dim)
+        self.blood_se = SEBlock(hidden_dim)
+        self.positional_encoding = nn.Parameter(torch.zeros(1, 2, hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, image_feat, blood_feat):
+        image_embed = self.image_embedding(image_feat)
+        blood_embed = self.blood_embedding(blood_feat)
+        image_embed = self.image_se(image_embed.unsqueeze(-1)).squeeze(-1)
+        blood_embed = self.blood_se(blood_embed.unsqueeze(-1)).squeeze(-1)
+        x = torch.stack([image_embed, blood_embed], dim=1)
+        x = x + self.positional_encoding
+        x = self.transformer_encoder(x)
+        x = x.mean(dim=1)
+        x = self.fc(x)
+        return x
+
+# 初始化模型
+feature_extractor = FeatureExtractor().to(device)
+se_transformer_fusion = SETransformerFusion(1000, blood_data_dim, hidden_dim, num_classes, num_layers, num_heads).to(device)
+
+# 使用多GPU训练
+if torch.cuda.device_count() > 1:
+    feature_extractor = nn.DataParallel(feature_extractor)
+    se_transformer_fusion = nn.DataParallel(se_transformer_fusion)
+
+# 定义优化器和损失函数
+optimizer_backbone = optim.SGD(feature_extractor.parameters(), lr=learning_rate, momentum=0.9,weight_decay=weight_decay)
+criterion = nn.CrossEntropyLoss()
+
+# 训练主干网络(特征提取器)
+def train_backbone():
+    feature_extractor.train()
+    
+    for epoch in range(num_epochs_backbone):
+        running_loss = 0.0
+        
+        for images, _, labels in train_dataloader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer_backbone.zero_grad()
+            outputs = feature_extractor(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer_backbone.step()
+
+            running_loss += loss.item()
+
+        print(f"Backbone Epoch [{epoch+1}/{num_epochs_backbone}], Loss: {running_loss/len(train_dataloader):.4f}")
+
+    # 保存主干网络权重  
+    torch.save(feature_extractor.state_dict(), 'backbone_weights.pt')
+
+# 训练SETransformerFusion模型
+def train_fusion():
+    feature_extractor.eval()
+    se_transformer_fusion.train()
+    
+    optimizer = optim.SGD(se_transformer_fusion.parameters(), lr=learning_rate, momentum=0.9,weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
+    
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        
+        for images, blood_feat, labels in train_dataloader:
+            images = images.to(device, non_blocking=True)
+            blood_feat = blood_feat.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            with torch.no_grad():
+                image_feat = feature_extractor(images)
+            outputs = se_transformer_fusion(image_feat, blood_feat)
+            loss = criterion(outputs, labels)
+            
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+        
+        scheduler.step()
+        
+        print(f"Fusion Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_dataloader):.4f}")
+
+# 评估模型性能
+def evaluate():
+    feature_extractor.eval()
+    se_transformer_fusion.eval()
+
+    with torch.no_grad():
+        train_image_features = []
+        test_image_features = []
+        
+        for images, _ in DataLoader(train_dataset, batch_size=batch_size):
+            images = images.to(device, non_blocking=True)
+            features = feature_extractor(images)
+            train_image_features.append(features)
+        
+        for images, _ in DataLoader(test_dataset, batch_size=batch_size):
+            images = images.to(device, non_blocking=True)
+            features = feature_extractor(images)
+            test_image_features.append(features)
+        
+        train_image_features = torch.cat(train_image_features)
+        test_image_features = torch.cat(test_image_features)
+        
+        train_outputs = se_transformer_fusion(train_image_features, torch.tensor(train_blood_data, dtype=torch.float32).to(device))
+        _, train_preds = torch.max(train_outputs, 1)
+        train_acc = accuracy_score(train_dataset.targets, train_preds.cpu())
+        train_cm = confusion_matrix(train_dataset.targets, train_preds.cpu())
+
+        test_outputs = se_transformer_fusion(test_image_features, torch.tensor(test_blood_data, dtype=torch.float32).to(device))
+        _, test_preds = torch.max(test_outputs, 1)
+        test_acc = accuracy_score(test_dataset.targets, test_preds.cpu())
+        test_cm = confusion_matrix(test_dataset.targets, test_preds.cpu())
+
+    print(f"Training Accuracy: {train_acc:.4f}")
+    print(f"Training Confusion Matrix:\n{train_cm}")
+    print(f"Testing Accuracy: {test_acc:.4f}") 
+    print(f"Testing Confusion Matrix:\n{test_cm}")
+
+# 持续学习
+def continual_learning():
+    num_new_classes = 0
+    
+    random_idx = np.random.randint(len(test_dataset))
+    random_image, random_label = test_dataset[random_idx]
+    random_image = random_image.unsqueeze(0).to(device)
+
+    # 生成随机的血常规数据（不合理）
+    random_blood_data = torch.FloatTensor(1, blood_data_dim).uniform_(0, 100).to(device)
+
+    # 输入模型进行分类
+    with torch.no_grad():
+        random_image_feature = feature_extractor(random_image)
+        random_output = se_transformer_fusion(random_image_feature, random_blood_data)
+        _, random_pred = torch.max(random_output, 1)
+        random_confidence = torch.softmax(random_output, dim=1).max().item()
+
+    print(f"Random image predicted label: {random_pred.item()}")
+    print(f"Confidence: {random_confidence:.4f}")
+
+    # 判断是否需要进行持续学习
+    if random_confidence < confidence_threshold:
+        print("Confidence is below threshold. Starting continual learning...")
+
+        # 将随机图像标记为新类别
+        new_class_label = num_classes + num_new_classes
+        num_new_classes += 1
+
+        # 将随机图像及其血常规数据添加到持续学习数据集中
+        continual_dataset = MultimodalDataset(train_dataset + [(random_image.squeeze(0).cpu(), new_class_label)],
+                                        train_blood_data + [random_blood_data.squeeze(0).cpu().numpy().tolist()])
+        continual_dataloader = DataLoader(continual_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+        # 更新输出层以适应新的类别数量
+        se_transformer_fusion.module.fc = nn.Linear(hidden_dim, num_classes + num_new_classes).to(device)
+
+        # 定义持续学习的优化器和损失函数
+        continual_optimizer = optim.Adam(se_transformer_fusion.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        continual_criterion = nn.CrossEntropyLoss()
+
+        # 进行持续学习
+        for epoch in range(num_epochs_continual):
+            se_transformer_fusion.train()
+
+            running_loss = 0.0
+            for images, blood_feat, labels in continual_dataloader:
+                images = images.to(device, non_blocking=True)
+                blood_feat = blood_feat.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+
+                continual_optimizer.zero_grad()
+
+                with torch.no_grad():
+                    image_feat = feature_extractor(images)
+                outputs = se_transformer_fusion(image_feat, blood_feat)
+                loss = continual_criterion(outputs, labels)
+
+                loss.backward()
+                continual_optimizer.step()
+
+                running_loss += loss.item()
+
+            print(f"Continual Learning Epoch [{epoch+1}/{num_epochs_continual}], Loss: {running_loss/len(continual_dataloader):.4f}")
+
+        # 更新类别数量
+        num_classes += num_new_classes
+
+        # 使用更新后的模型进行预测
+        with torch.no_grad():
+            random_image_feature = feature_extractor(random_image)
+            random_output = se_transformer_fusion(random_image_feature, random_blood_data)
+            _, adapted_pred = torch.max(random_output, 1)
+        print(f"Adapted prediction: {adapted_pred.item()}")
+
+    else:
+        print("Confidence is above threshold. No need for continual learning.")
+
+# 主函数
+def main():
+    train_backbone()
+    train_fusion()
+    evaluate()
+    continual_learning()
+
+if __name__ == '__main__':
+    main()
