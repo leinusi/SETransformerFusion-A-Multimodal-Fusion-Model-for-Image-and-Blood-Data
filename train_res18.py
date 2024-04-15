@@ -18,9 +18,9 @@ image_size = (224, 224)
 batch_size = 128
 learning_rate = 0.001
 weight_decay = 0.01
-num_epochs_backbone = 20
-num_epochs = 3
-num_epochs_continual = 10
+num_epochs_backbone = 1
+num_epochs = 1
+num_epochs_continual = 1
 hidden_dim = 1000
 num_layers = 2
 num_heads = 8
@@ -165,7 +165,7 @@ if torch.cuda.device_count() > 1:
     se_transformer_fusion = nn.DataParallel(se_transformer_fusion)
 
 # 定义优化器和损失函数
-optimizer_backbone = optim.SGD(feature_extractor.parameters(), lr=learning_rate, momentum=0.9,weight_decay=weight_decay)
+optimizer_backbone = optim.SGD(feature_extractor.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
 criterion = nn.CrossEntropyLoss()
 
 # 训练主干网络(特征提取器)
@@ -262,7 +262,7 @@ def evaluate():
     print(f"Testing Confusion Matrix:\n{test_cm}")
 
 # 持续学习
-def continual_learning():
+def continual_learning(num_classes):
     num_new_classes = 0
     
     random_idx = np.random.randint(len(test_dataset))
@@ -341,10 +341,11 @@ def continual_learning():
 
 # 主函数
 def main():
+    global num_classes
     train_backbone()
     train_fusion()
     evaluate()
-    continual_learning()
+    num_classes = continual_learning(num_classes)
 
 if __name__ == '__main__':
     main()
